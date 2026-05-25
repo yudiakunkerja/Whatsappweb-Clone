@@ -1,0 +1,9 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "devCommand": "npm run dev",
+  "framework": "vite",
+  "env": {
+    "VITE_BACKEND_URL": "https://your-backend.railway.app"
+  }
+}
