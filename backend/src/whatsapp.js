@@ -5,7 +5,8 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   jidNormalizedUser,
-  Browsers
+  Browsers,
+  WA_DEFAULT_EPHEMERAL
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const fs = require('fs').promises;
@@ -21,14 +22,21 @@ class WhatsAppService {
     this.isConnected = false;
     this.qrCode = null;
     this.user = null;
-    this.logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+    // 🔍 Ubah ke 'debug' sementara untuk lihat error asli dari Baileys
+    this.logger = pino({ 
+      level: process.env.LOG_LEVEL || 'debug',
+      transport: process.env.NODE_ENV === 'production' ? undefined : {
+        target: 'pino-pretty',
+        options: { colorize: true }
+      }
+    });
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
   }
 
   async initialize() {
     try {
       const authPath = path.join(__dirname, '../auth');
-      
-      // Ensure auth directory exists
       await fs.mkdir(authPath, { recursive: true });
 
       const { state, saveCreds } = await useMultiFileAuthState(authPath);
@@ -36,6 +44,9 @@ class WhatsAppService {
 
       const { version } = await fetchLatestBaileysVersion();
       
+      this.logger.info('🔧 Initializing Baileys with version:', version);
+      
+      // ⚙️ KONFIGURASI KHUSUS UNTUK CLOUD/RAILWAY
       this.sock = makeWASocket({
         version,
         logger: this.logger,
@@ -45,38 +56,62 @@ class WhatsAppService {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, this.logger),
         },
+        // 🌐 Konfigurasi WebSocket untuk bypass proxy Railway
+        waWebSocketUrl: 'wss://web.whatsapp.com/ws/chat',
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 30000,
+        defaultQueryTimeoutMs: 30000,
+        // ⚡ Optimasi untuk cloud
+        syncFullHistory: false,
+        patchMessageBeforeSending: (msg) => msg,
+        // 📦 Message handler
         getMessage: async (key) => {
-          // You can implement message store here
-          return { conversation: 'hello' };
+          return { conversation: '' };
         },
+        // 🔐 Optional: ephemeral messages
+        ephemeralExpiration: WA_DEFAULT_EPHEMERAL,
       });
 
       this.setupEventHandlers();
-      this.logger.info('📱 WhatsApp service initialized');
+      this.logger.info('📱 WhatsApp service initialized successfully');
       
       return this.sock;
     } catch (error) {
-      this.logger.error('Failed to initialize WhatsApp:', error);
+      this.logger.error('❌ Failed to initialize WhatsApp:', {
+        message: error.message,
+        stack: error.stack,
+        name: error.name
+      });
       throw error;
     }
   }
 
   setupEventHandlers() {
     // Handle credentials update
-    this.sock.ev.on('creds.update', this.authState.saveCreds);
+    this.sock.ev.on('creds.update', async () => {
+      await this.authState.saveCreds();
+      this.logger.debug('🔐 Credentials updated');
+    });
 
     // Handle connection updates
     this.sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, receivedPendingNotifications } = update;
+
+      this.logger.debug('🔗 Connection update:', { 
+        connection, 
+        qr: !!qr,
+        receivedPendingNotifications 
+      });
 
       // QR Code received
       if (qr) {
         try {
           this.qrCode = await qrcode.toDataURL(qr);
           this.broadcast({ type: 'qr', data: this.qrCode });
-          this.logger.info('📱 QR Code generated');
+          this.logger.info('📱 QR Code generated and sent to client');
+          this.reconnectAttempts = 0; // Reset reconnect counter on new QR
         } catch (error) {
-          this.logger.error('QR Code generation failed:', error);
+          this.logger.error('❌ QR Code generation failed:', error);
         }
       }
 
@@ -85,6 +120,7 @@ class WhatsAppService {
         this.isConnected = true;
         this.user = this.sock.user;
         this.qrCode = null;
+        this.reconnectAttempts = 0;
         
         this.broadcast({ 
           type: 'connected', 
@@ -104,8 +140,15 @@ class WhatsAppService {
       if (connection === 'close') {
         this.isConnected = false;
         const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const shouldReconnect = this.shouldReconnect(statusCode);
         
+        this.logger.warn('❌ WhatsApp disconnected:', {
+          reason: lastDisconnect?.error?.message,
+          statusCode,
+          shouldReconnect,
+          attempts: this.reconnectAttempts
+        });
+
         this.broadcast({ 
           type: 'disconnected', 
           data: { 
@@ -115,19 +158,21 @@ class WhatsAppService {
           } 
         });
 
-        this.logger.warn('❌ WhatsApp disconnected:', {
-          reason: lastDisconnect?.error?.message,
-          shouldReconnect,
-          statusCode
-        });
-
         if (shouldReconnect) {
-          this.logger.info('🔄 Reconnecting in 3 seconds...');
-          setTimeout(() => this.initialize(), 3000);
+          this.reconnectAttempts++;
+          const delay = Math.min(1000 * this.reconnectAttempts, 10000);
+          this.logger.info(`🔄 Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+          setTimeout(() => this.initialize(), delay);
         } else {
-          // Clear auth data on logout
+          this.logger.info('🚫 Not reconnecting - clearing auth data');
           await this.clearAuth();
+          this.broadcast({ type: 'logged_out' });
         }
+      }
+
+      // Handle pending notifications
+      if (receivedPendingNotifications) {
+        this.logger.info('📨 Received pending notifications');
       }
     });
 
@@ -136,12 +181,11 @@ class WhatsAppService {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue; // Skip messages from self
+        if (msg.key.fromMe) continue;
 
         const chatId = msg.key.remoteJid;
         const sender = jidNormalizedUser(msg.key.participant || chatId);
         
-        // Extract message text
         let text = '';
         if (msg.message?.conversation) {
           text = msg.message.conversation;
@@ -151,9 +195,14 @@ class WhatsAppService {
           text = msg.message.imageMessage.caption;
         } else if (msg.message?.videoMessage?.caption) {
           text = msg.message.videoMessage.caption;
+        } else if (msg.message?.documentMessage?.caption) {
+          text = msg.message.documentMessage.caption;
         }
 
-        if (!text) continue;
+        if (!text) {
+          this.logger.debug('⚠️ Message with no text received, skipping');
+          continue;
+        }
 
         this.broadcast({
           type: 'message:incoming',
@@ -168,11 +217,11 @@ class WhatsAppService {
           }
         });
 
-        this.logger.info('📨 New message:', { from: sender, text });
+        this.logger.info('📨 New message:', { from: sender, text: text.substring(0, 50) + '...' });
       }
     });
 
-    // Handle message status updates (sent, delivered, read)
+    // Handle message status updates
     this.sock.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         this.broadcast({
@@ -186,13 +235,37 @@ class WhatsAppService {
       }
     });
 
-    // Handle chat updates (unread count, etc)
+    // Handle chat updates
     this.sock.ev.on('chats.update', async (chats) => {
       this.broadcast({
         type: 'chats:update',
         data: chats
       });
     });
+
+    // Handle connection reset / validation errors
+    this.sock.ev.on('connection.reset', async () => {
+      this.logger.warn('🔄 Connection reset by server');
+    });
+
+    this.sock.ev.on('messages.reaction', async (reactions) => {
+      this.logger.debug('⚡ Message reaction:', reactions);
+    });
+  }
+
+  // 🔍 Helper: Tentukan apakah harus reconnect berdasarkan status code
+  shouldReconnect(statusCode) {
+    // Jangan reconnect jika:
+    if (statusCode === DisconnectReason.loggedOut) return false;
+    if (statusCode === DisconnectReason.badSession) return false;
+    if (statusCode === DisconnectReason.connectionClosed) return true;
+    if (statusCode === DisconnectReason.connectionLost) return true;
+    if (statusCode === DisconnectReason.connectionReplaced) return false;
+    if (statusCode === DisconnectReason.restartRequired) return true;
+    if (statusCode === DisconnectReason.timedOut) return true;
+    
+    // Default: reconnect jika belum mencapai max attempts
+    return this.reconnectAttempts < this.maxReconnectAttempts;
   }
 
   // Broadcast to all WebSocket clients
@@ -203,9 +276,13 @@ class WhatsAppService {
     let clientCount = 0;
     
     this.wsServer.clients.forEach(client => {
-      if (client.readyState === 1) { // WebSocket.OPEN
-        client.send(message);
-        clientCount++;
+      if (client.readyState === 1) {
+        try {
+          client.send(message);
+          clientCount++;
+        } catch (err) {
+          this.logger.error('❌ Failed to send to client:', err);
+        }
       }
     });
 
@@ -216,16 +293,19 @@ class WhatsAppService {
 
   // Send message
   async sendMessage(to, text) {
-    if (!this.isConnected) {
+    if (!this.isConnected || !this.sock) {
       throw new Error('WhatsApp belum terhubung. Silakan scan QR code.');
     }
 
     try {
       const result = await this.sock.sendMessage(to, { text });
-      this.logger.info('✅ Message sent:', { to, id: result.key.id });
+      this.logger.info('✅ Message sent:', { to, id: result?.key?.id });
       return result;
     } catch (error) {
-      this.logger.error('Failed to send message:', error);
+      this.logger.error('❌ Failed to send message:', {
+        message: error.message,
+        to
+      });
       throw error;
     }
   }
@@ -243,7 +323,7 @@ class WhatsAppService {
         timestamp: chat.conversationTimestamp,
       }));
     } catch (error) {
-      this.logger.error('Failed to get chats:', error);
+      this.logger.error('❌ Failed to get chats:', error);
       return [];
     }
   }
@@ -258,11 +338,12 @@ class WhatsAppService {
       this.isConnected = false;
       this.user = null;
       this.qrCode = null;
+      this.reconnectAttempts = 0;
       
       this.broadcast({ type: 'logged_out' });
-      this.logger.info('🚪 User logged out');
+      this.logger.info('🚪 User logged out successfully');
     } catch (error) {
-      this.logger.error('Logout error:', error);
+      this.logger.error('❌ Logout error:', error);
       throw error;
     }
   }
@@ -274,7 +355,7 @@ class WhatsAppService {
       await fs.rm(authPath, { recursive: true, force: true });
       this.logger.info('🗑️ Auth data cleared');
     } catch (error) {
-      this.logger.error('Failed to clear auth:', error);
+      this.logger.error('❌ Failed to clear auth:', error);
     }
   }
 
@@ -283,7 +364,8 @@ class WhatsAppService {
     return {
       connected: this.isConnected,
       user: this.user,
-      hasQR: !!this.qrCode
+      hasQR: !!this.qrCode,
+      reconnectAttempts: this.reconnectAttempts
     };
   }
 }
