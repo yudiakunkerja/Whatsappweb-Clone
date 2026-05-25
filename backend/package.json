@@ -1,26 +1,36 @@
 {
   "name": "whatsapp-backend",
   "version": "1.0.0",
-  "description": "WhatsApp Web Clone Backend",
+  "description": "WhatsApp Web Clone Backend - Cloud Ready",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "postinstall": "echo 'Dependencies installed successfully'"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5",
+    "@whiskeysockets/baileys": "^6.7.9",
     "@hapi/boom": "^10.0.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "qrcode": "^1.5.3",
-    "ws": "^8.17.0",
-    "pino": "^8.21.0"
+    "express": "^4.21.0",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.2",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemon": "^3.1.7"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "websocket",
+    "cloud"
+  ],
+  "author": "",
+  "license": "MIT"
 }
